@@ -64,48 +64,53 @@ jobs:
   #
   # Falhar aqui trava o deploy de propósito. Um banco que recusou a migração é
   # exatamente o banco em que o código novo não deve entrar.
-  migrate:
-    name: Migra o banco
-    needs: verify
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    # Mesmo Environment do deploy: é dele que sai o DATABASE_URL.
-    environment:
-      name: Production
-    steps:
-      - uses: actions/checkout@v5
-
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.0
-
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: pnpm
-
-      # Só o serviço e o que ele depende: instalar o workspace inteiro aqui
-      # seria baixar o SDK do LiveKit e o React para rodar um ALTER TABLE.
-      - name: Instala o serviço
-        run: pnpm install --frozen-lockfile --filter @telecord/api...
-
-      - name: prisma migrate deploy
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL || vars.DATABASE_URL }}
-        run: |
-          set -euo pipefail
-          if [ -z "${DATABASE_URL:-}" ]; then
-            # Sem banco configurado o app roda sem contas, que é um estado
-            # legítimo do produto. Pular é o certo; falhar seria exigir banco
-            # de quem só quer publicar a sala.
-            echo "DATABASE_URL vazia — sem banco configurado, nada a migrar."
-            exit 0
-          fi
-          pnpm --filter @telecord/api exec prisma migrate deploy
+  # migrate:
+  #   name: Migra o banco
+  #   needs: verify
+  #   if: github.event_name != 'pull_request'
+  #   runs-on: ubuntu-latest
+  #   # Mesmo Environment do deploy: é dele que sai o DATABASE_URL.
+  #   environment:
+  #     name: Production
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #
+  #     - uses: pnpm/action-setup@v4
+  #       with:
+  #         version: 9.15.0
+  #
+  #     - uses: actions/setup-node@v5
+  #       with:
+  #         node-version: 22
+  #         cache: pnpm
+  #
+  #     - name: Instala o serviço
+  #       run: pnpm install --frozen-lockfile --filter @telecord/api...
+  #
+  #     - name: prisma migrate deploy
+  #       env:
+  #         DATABASE_URL: ${{ secrets.DATABASE_URL || vars.DATABASE_URL }}
+  #       run: |
+  #         set -euo pipefail
+  #         if [ -z "${DATABASE_URL:-}" ]; then
+  #           # Sem banco configurado o app roda sem contas, que é um estado
+  #           # legítimo do produto. Pular é o certo; falhar seria exigir banco
+  #           # de quem só quer publicar a sala.
+  #           echo "DATABASE_URL vazia — sem banco configurado, nada a migrar."
+  #           exit 0
+  #         fi
+  #         pnpm --filter @telecord/api exec prisma migrate deploy
+  #
+  # Migrar o banco é parte do Telecord completo. Comentado para o Telecord
+  # simples (sem persistência). Para reativar, remova os caracteres '# ' no
+  # início destas linhas e garanta que `DATABASE_URL` esteja configurada.
 
   deploy:
     name: Publica em produção
-    needs: [verify, migrate]
+    # Para o Telecord simples mantemos apenas a publicação na Vercel e a
+    # verificação; não dependemos de migrações (sem banco). Ajustado para
+    # depender só de `verify`.
+    needs: verify
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # O nome tem que bater com o Environment configurado no GitHub.
@@ -400,133 +405,104 @@ jobs:
 
           exit $fail
 
-  # Proxy TLS ÚNICO da VM (ver infra/docker-compose.proxy.yml) — compartilhado
-  # entre o LiveKit e o mediasoup-sfu desde que o segundo processo passou a
-  # dividir a mesma VM. Roda ANTES dos dois (needs em deploy-livekit e
-  # deploy-mediasoup), porque cria a rede Docker externa "telecord-proxy" que
-  # os outros dois compose esperam encontrar já criada.
-  deploy-proxy:
-    name: Publica o proxy TLS (VM)
-    needs: verify
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    environment:
-      name: Production
-    env:
-      LIVEKIT_VM_SSH_KEY: ${{ secrets.LIVEKIT_VM_SSH_KEY || vars.LIVEKIT_VM_SSH_KEY }}
-    steps:
-      - name: Mascara a chave, se veio de variable em texto plano
-        run: |
-          if [ -n "${LIVEKIT_VM_SSH_KEY:-}" ]; then
-            echo "::add-mask::$LIVEKIT_VM_SSH_KEY"
-          fi
-
-      - uses: actions/checkout@v5
-
-      # Garante a pasta ANTES do scp, com o dono certo. Sem isto, a primeira
-      # vez que este job roda numa VM nova o SCP falha calado com "Process
-      # exited with status 1" se /opt/telecord-proxy não existir ainda ou já
-      # existir com outro dono (ex.: criada à mão com `sudo mkdir` sem
-      # `chown`) — mesmo padrão que já mordeu o setup manual do LiveKit, daí
-      # `setup-vm.sh` fazer `sudo mkdir` + `sudo chown $USER` por lá. Aqui o
-      # workflow deixa de depender de alguém lembrar de fazer isso à mão.
-      - name: Garante a pasta de deploy na VM, com o dono certo
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            sudo mkdir -p /opt/telecord-proxy
-            sudo chown "$(whoami)":"$(whoami)" /opt/telecord-proxy
-
-      # MIGRAÇÃO ÚNICA: antes deste proxy compartilhado existir, o LiveKit
-      # tinha seu PRÓPRIO Caddy (ver histórico de livekit/docker-compose.
-      # prod.yml) segurando 80/443 sozinho. Numa VM que já tinha isso rodando
-      # de um deploy anterior, o `docker compose up` do proxy novo falha com
-      # "port is already allocated" — o Caddy antigo nunca chega a ser
-      # substituído sozinho porque vive num compose diferente. `|| true`
-      # porque numa VM nova (sem esse Caddy antigo) o `down` não tem o que
-      # derrubar, e isso não pode falhar o job.
-      - name: Derruba o Caddy antigo do LiveKit, se ainda existir
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          script: |
-            set -uo pipefail
-            if [ -f /opt/telecord-livekit/docker-compose.prod.yml ]; then
-              cd /opt/telecord-livekit
-              docker compose -f docker-compose.prod.yml stop caddy || true
-              docker compose -f docker-compose.prod.yml rm -f caddy || true
-            fi
-            exit 0
-
-      - name: Copia os arquivos de deploy para a VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          source: 'infra/docker-compose.proxy.yml,infra/Caddyfile'
-          target: /opt/telecord-proxy
-          strip_components: 1
-
-      # LIVEKIT_PUBLIC_HOST e MEDIASOUP_PUBLIC_HOST não são segredo (são só o
-      # hostname nip.io público), então escrever o .env aqui — a partir do
-      # Environment do GitHub, mesma fonte que `deploy-livekit` já usa para
-      # verificar o deploy — é mais simples que depender de alguém preparar
-      # esse arquivo à mão na VM antes do primeiro deploy.
-      # O Caddyfile tem um site block por host (ver infra/Caddyfile) — se os
-      # dois vierem iguais, o Caddy recusa subir com "ambiguous site
-      # definition" e fica em crash-loop silencioso (foi o que aconteceu:
-      # LIVEKIT_PUBLIC_HOST e MEDIASOUP_PUBLIC_HOST configurados com o MESMO
-      # valor no Environment). Falhar aqui, ANTES de escrever o .env, dá um
-      # erro claro no lugar de um 502 só descoberto minutos depois nos
-      # healthchecks de LiveKit/mediasoup.
-      - name: Confere que os dois hosts públicos são diferentes
-        run: |
-          if [ -z "${LIVEKIT_PUBLIC_HOST:-}" ] || [ -z "${MEDIASOUP_PUBLIC_HOST:-}" ]; then
-            echo "::error::LIVEKIT_PUBLIC_HOST e MEDIASOUP_PUBLIC_HOST precisam estar definidos no Environment Production."
-            exit 1
-          fi
-          if [ "$LIVEKIT_PUBLIC_HOST" = "$MEDIASOUP_PUBLIC_HOST" ]; then
-            echo "::error::LIVEKIT_PUBLIC_HOST e MEDIASOUP_PUBLIC_HOST estão iguais ($LIVEKIT_PUBLIC_HOST) — o Caddy recusa subir com dois site blocks para o mesmo host. Use dois hosts nip.io distintos apontando para o mesmo IP (ex.: livekit-<ip>.nip.io e ms-<ip>.nip.io)."
-            exit 1
-          fi
-        env:
-          LIVEKIT_PUBLIC_HOST: ${{ secrets.LIVEKIT_PUBLIC_HOST || vars.LIVEKIT_PUBLIC_HOST }}
-          MEDIASOUP_PUBLIC_HOST: ${{ secrets.MEDIASOUP_PUBLIC_HOST || vars.MEDIASOUP_PUBLIC_HOST }}
-
-      - name: Escreve o .env do proxy na VM
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          envs: LIVEKIT_PUBLIC_HOST,MEDIASOUP_PUBLIC_HOST
-          script: |
-            set -euo pipefail
-            cat > /opt/telecord-proxy/.env <<EOF2
-            LIVEKIT_PUBLIC_HOST=$LIVEKIT_PUBLIC_HOST
-            MEDIASOUP_PUBLIC_HOST=$MEDIASOUP_PUBLIC_HOST
-            EOF2
-        env:
-          LIVEKIT_PUBLIC_HOST: ${{ secrets.LIVEKIT_PUBLIC_HOST || vars.LIVEKIT_PUBLIC_HOST }}
-          MEDIASOUP_PUBLIC_HOST: ${{ secrets.MEDIASOUP_PUBLIC_HOST || vars.MEDIASOUP_PUBLIC_HOST }}
-
-      - name: Sobe o proxy na VM
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            cd /opt/telecord-proxy
-            docker compose -f docker-compose.proxy.yml up -d --remove-orphans
+  # deploy-proxy:
+  #   name: Publica o proxy TLS (VM)
+  #   needs: verify
+  #   if: github.event_name != 'pull_request'
+  #   runs-on: ubuntu-latest
+  #   environment:
+  #     name: Production
+  #   env:
+  #     LIVEKIT_VM_SSH_KEY: ${{ secrets.LIVEKIT_VM_SSH_KEY || vars.LIVEKIT_VM_SSH_KEY }}
+  #   steps:
+  #     - name: Mascara a chave, se veio de variable em texto plano
+  #       run: |
+  #         if [ -n "${LIVEKIT_VM_SSH_KEY:-}" ]; then
+  #           echo "::add-mask::$LIVEKIT_VM_SSH_KEY"
+  #         fi
+  #
+  #     - uses: actions/checkout@v5
+  #
+  #     - name: Garante a pasta de deploy na VM, com o dono certo
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         script: |
+  #           set -euo pipefail
+  #           sudo mkdir -p /opt/telecord-proxy
+  #           sudo chown "$(whoami)":"$(whoami)" /opt/telecord-proxy
+  #
+  #     - name: Derruba o Caddy antigo do LiveKit, se ainda existir
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         script: |
+  #           set -uo pipefail
+  #           if [ -f /opt/telecord-livekit/docker-compose.prod.yml ]; then
+  #             cd /opt/telecord-livekit
+  #             docker compose -f docker-compose.prod.yml stop caddy || true
+  #             docker compose -f docker-compose.prod.yml rm -f caddy || true
+  #           fi
+  #           exit 0
+  #
+  #     - name: Copia os arquivos de deploy para a VM
+  #       uses: appleboy/scp-action@v0.1.7
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         source: 'infra/docker-compose.proxy.yml,infra/Caddyfile'
+  #         target: /opt/telecord-proxy
+  #         strip_components: 1
+  #
+  #     - name: Confere que os dois hosts públicos são diferentes
+  #       run: |
+  #         if [ -z "${LIVEKIT_PUBLIC_HOST:-}" ] || [ -z "${MEDIASOUP_PUBLIC_HOST:-}" ]; then
+  #           echo "::error::LIVEKIT_PUBLIC_HOST e MEDIASOUP_PUBLIC_HOST precisam estar definidos no Environment Production."
+  #           exit 1
+  #         fi
+  #         if [ "$LIVEKIT_PUBLIC_HOST" = "$MEDIASOUP_PUBLIC_HOST" ]; then
+  #           echo "::error::LIVEKIT_PUBLIC_HOST e MEDIASOUP_PUBLIC_HOST estão iguais ($LIVEKIT_PUBLIC_HOST) — o Caddy recusa subir com dois site blocks para o mesmo host. Use dois hosts nip.io distintos apontando para o mesmo IP (ex.: livekit-<ip>.nip.io e ms-<ip>.nip.io)."
+  #           exit 1
+  #         fi
+  #       env:
+  #         LIVEKIT_PUBLIC_HOST: ${{ secrets.LIVEKIT_PUBLIC_HOST || vars.LIVEKIT_PUBLIC_HOST }}
+  #         MEDIASOUP_PUBLIC_HOST: ${{ secrets.MEDIASOUP_PUBLIC_HOST || vars.MEDIASOUP_PUBLIC_HOST }}
+  #
+  #     - name: Escreve o .env do proxy na VM
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         envs: LIVEKIT_PUBLIC_HOST,MEDIASOUP_PUBLIC_HOST
+  #         script: |
+  #           set -euo pipefail
+  #           cat > /opt/telecord-proxy/.env <<EOF2
+  #           LIVEKIT_PUBLIC_HOST=$LIVEKIT_PUBLIC_HOST
+  #           MEDIASOUP_PUBLIC_HOST=$MEDIASOUP_PUBLIC_HOST
+  #           EOF2
+  #       env:
+  #         LIVEKIT_PUBLIC_HOST: ${{ secrets.LIVEKIT_PUBLIC_HOST || vars.LIVEKIT_PUBLIC_HOST }}
+  #         MEDIASOUP_PUBLIC_HOST: ${{ secrets.MEDIASOUP_PUBLIC_HOST || vars.MEDIASOUP_PUBLIC_HOST }}
+  #
+  #     - name: Sobe o proxy na VM
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         script: |
+  #           set -euo pipefail
+  #           cd /opt/telecord-proxy
+  #           docker compose -f docker-compose.proxy.yml up -d --remove-orphans
+  #
+  # Comentado: este job publica um proxy TLS na VM que não é necessário para o
+  # Telecord simples. Para reativar, remova os '#' no início destas linhas.
 
   # Servidor LiveKit self-host, numa VM à parte (Oracle Cloud) — desacoplado
   # do deploy da Vercel acima: um não depende do outro, e este só faz sentido
@@ -536,222 +512,171 @@ jobs:
   # livekit/setup-vm.sh nela uma vez (Docker instalado, firewall aberto,
   # /opt/telecord-livekit criado com o .env preenchido). Este job só copia os
   # arquivos que definem o serviço e manda subir de novo.
-  deploy-livekit:
-    name: Publica o LiveKit (VM)
-    # Só depois do proxy — nunca em paralelo com deploy-mediasoup: a VM é uma
-    # E2.1.Micro com ~500MB de RAM real, e o `docker compose build` do
-    # mediasoup (pnpm install + tsc + download do worker nativo) rodando ao
-    # mesmo tempo que este `pull`/`up` do LiveKit esgota a memória da VM — foi
-    # o que derrubou os dois jobs juntos (LiveKit com "couldn't connect",
-    # mediasoup com build incompleto). Rodar em série custa alguns minutos a
-    # mais por deploy; rodar em paralelo já derrubou o deploy inteiro.
-    needs: [verify, deploy-proxy]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    environment:
-      name: Production
-    env:
-      # A chave privada de SSH deveria SEMPRE viver em `secrets` — como
-      # `vars`, ela fica em texto plano e não é mascarada em log. O fallback
-      # existe só para não travar quem colou no lugar errado sem perceber;
-      # mova para Environment secrets assim que possível.
-      LIVEKIT_VM_SSH_KEY: ${{ secrets.LIVEKIT_VM_SSH_KEY || vars.LIVEKIT_VM_SSH_KEY }}
-    steps:
-      - name: Mascara a chave, se veio de variable em texto plano
-        run: |
-          if [ -n "${LIVEKIT_VM_SSH_KEY:-}" ]; then
-            echo "::add-mask::$LIVEKIT_VM_SSH_KEY"
-          fi
-
-      - uses: actions/checkout@v5
-
-      - name: Copia os arquivos de deploy para a VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          source: 'livekit/docker-compose.prod.yml,livekit/livekit.yaml'
-          target: /opt/telecord-livekit
-          strip_components: 1
-
-      - name: Sobe o serviço na VM
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          # O .env já mora na VM (feito manualmente uma vez, ver
-          # livekit/setup-vm.sh) — nunca é escrito por este workflow, então
-          # nenhuma credencial passa pelo runner do Actions.
-          script: |
-            set -euo pipefail
-            cd /opt/telecord-livekit
-            docker compose -f docker-compose.prod.yml pull
-            docker compose -f docker-compose.prod.yml up -d --remove-orphans
-
-      - name: Verifica o deploy
-        env:
-          # O certificado TLS é emitido para LIVEKIT_PUBLIC_HOST (o domínio
-          # nip.io), não para LIVEKIT_VM_HOST (o IP usado só para SSH) — são
-          # duas variáveis diferentes de propósito, testar pelo IP bateria
-          # num certificado que não é dele.
-          HOST: ${{ secrets.LIVEKIT_PUBLIC_HOST || vars.LIVEKIT_PUBLIC_HOST }}
-        run: |
-          set -euo pipefail
-          # "/" é o health check do LiveKit: sempre responde 200 "OK" quando o
-          # processo está de pé e o Caddy repassou a requisição. `/rtc` SEM
-          # query string na verdade responde 404 nesta versão — não é rota de
-          # health check, é o próprio handshake WebSocket, que exige
-          # access_token para dar qualquer resposta diferente de 404.
-          #
-          # Retry, não uma tentativa só: `docker compose up -d` no passo
-          # anterior retorna assim que o container É CRIADO, não quando o
-          # livekit-server já está de fato escutando em 7880 — o entrypoint
-          # ainda precisa instalar gettext e rodar envsubst antes de subir o
-          # binário. Uma curl imediata batia nisso com "couldn't connect"
-          # (exit 7) e derrubava o job à toa, mesmo com o serviço subindo
-          # normalmente alguns segundos depois.
-          ok=0
-          for i in $(seq 1 10); do
-            code=$(curl -sS -o /tmp/rtc.json -w '%{http_code}' --max-time 10 "https://$HOST/" || echo 000)
-            if [ "$code" = "200" ]; then
-              ok=1
-              break
-            fi
-            echo "tentativa $i: $code — aguardando o LiveKit subir…"
-            sleep 3
-          done
-          if [ "$ok" = "1" ]; then
-            echo "ok ($code)"
-          else
-            echo "::error::https://$HOST/ respondeu $code"
-            cat /tmp/rtc.json || true
-            exit 1
-          fi
-          echo "### LiveKit verificado" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://$HOST" >> "$GITHUB_STEP_SUMMARY"
+  # deploy-livekit:
+  #   name: Publica o LiveKit (VM)
+  #   needs: [verify, deploy-proxy]
+  #   if: github.event_name != 'pull_request'
+  #   runs-on: ubuntu-latest
+  #   environment:
+  #     name: Production
+  #   env:
+  #     LIVEKIT_VM_SSH_KEY: ${{ secrets.LIVEKIT_VM_SSH_KEY || vars.LIVEKIT_VM_SSH_KEY }}
+  #   steps:
+  #     - name: Mascara a chave, se veio de variable em texto plano
+  #       run: |
+  #         if [ -n "${LIVEKIT_VM_SSH_KEY:-}" ]; then
+  #           echo "::add-mask::$LIVEKIT_VM_SSH_KEY"
+  #         fi
+  #
+  #     - uses: actions/checkout@v5
+  #
+  #     - name: Copia os arquivos de deploy para a VM
+  #       uses: appleboy/scp-action@v0.1.7
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         source: 'livekit/docker-compose.prod.yml,livekit/livekit.yaml'
+  #         target: /opt/telecord-livekit
+  #         strip_components: 1
+  #
+  #     - name: Sobe o serviço na VM
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         script: |
+  #           set -euo pipefail
+  #           cd /opt/telecord-livekit
+  #           docker compose -f docker-compose.prod.yml pull
+  #           docker compose -f docker-compose.prod.yml up -d --remove-orphans
+  #
+  #     - name: Verifica o deploy
+  #       env:
+  #         HOST: ${{ secrets.LIVEKIT_PUBLIC_HOST || vars.LIVEKIT_PUBLIC_HOST }}
+  #       run: |
+  #         set -euo pipefail
+  #         ok=0
+  #         for i in $(seq 1 10); do
+  #           code=$(curl -sS -o /tmp/rtc.json -w '%{http_code}' --max-time 10 "https://$HOST/" || echo 000)
+  #           if [ "$code" = "200" ]; then
+  #             ok=1
+  #             break
+  #           fi
+  #           echo "tentativa $i: $code — aguardando o LiveKit subir…"
+  #           sleep 3
+  #         done
+  #         if [ "$ok" = "1" ]; then
+  #           echo "ok ($code)"
+  #         else
+  #           echo "::error::https://$HOST/ respondeu $code"
+  #           cat /tmp/rtc.json || true
+  #           exit 1
+  #         fi
+  #         echo "### LiveKit verificado" >> "$GITHUB_STEP_SUMMARY"
+  #         echo "https://$HOST" >> "$GITHUB_STEP_SUMMARY"
+  #
+  # Comentado: deploy do LiveKit self-hosted em VM (não usado no Telecord
+  # simples). Para reativar remova os '#' no início destas linhas e garanta
+  # as chaves/hosts necessários no Environment.
 
   # Processo mediasoup-sfu (transporte 'mediasoup') — mesma VM do LiveKit,
   # mesmo padrão de deploy desacoplado. `--build` porque, diferente do
   # LiveKit, a imagem aqui é NOSSA (mediasoup/Dockerfile), não um binário de
   # terceiro — não há o que dar `pull`.
-  deploy-mediasoup:
-    name: Publica o mediasoup-sfu (VM)
-    # needs inclui deploy-livekit (não só deploy-proxy) de propósito: força
-    # este job a esperar o LiveKit terminar de subir antes de começar o
-    # `docker compose build` pesado do mediasoup na mesma VM — ver o
-    # comentário em deploy-livekit sobre os ~500MB de RAM da VM.
-    needs: [verify, deploy-proxy, deploy-livekit]
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    environment:
-      name: Production
-    env:
-      LIVEKIT_VM_SSH_KEY: ${{ secrets.LIVEKIT_VM_SSH_KEY || vars.LIVEKIT_VM_SSH_KEY }}
-    steps:
-      - name: Mascara a chave, se veio de variable em texto plano
-        run: |
-          if [ -n "${LIVEKIT_VM_SSH_KEY:-}" ]; then
-            echo "::add-mask::$LIVEKIT_VM_SSH_KEY"
-          fi
-
-      - uses: actions/checkout@v5
-
-      # O Dockerfile builda a partir da RAIZ do repo (precisa de
-      # packages/shared) — por isso o monorepo inteiro vai para a VM, não só
-      # a pasta mediasoup/. Ainda assim é bem mais leve que node_modules do
-      # workspace completo: só código-fonte.
-      # Mesmo motivo do "Garante a pasta" em deploy-proxy: sem isto, a
-      # primeira vez numa VM nova (ou uma pasta criada à mão sem chown) faz o
-      # SCP falhar calado com "Process exited with status 1".
-      - name: Garante a pasta de deploy na VM, com o dono certo
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          script: |
-            set -euo pipefail
-            sudo mkdir -p /opt/telecord-mediasoup-src
-            sudo chown "$(whoami)":"$(whoami)" /opt/telecord-mediasoup-src
-
-      # O repositório inteiro vai para a VM (o Dockerfile builda com
-      # `context: ../` a partir de mediasoup/, e precisa de packages/shared
-      # ao lado).
-      - name: Copia o repositório para a VM
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          source: '.'
-          target: /opt/telecord-mediasoup-src
-
-      # MEDIASOUP_ANNOUNCED_IP é o mesmo IP público da VM que já vale como
-      # LIVEKIT_VM_HOST/LIVEKIT_NODE_IP — não precisa de um secret à parte.
-      # MEDIASOUP_INTERNAL_SECRET é sensível de verdade; escrito aqui a
-      # partir do Environment do GitHub, nunca commitado.
-      - name: Escreve o .env do mediasoup-sfu na VM
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          envs: MEDIASOUP_INTERNAL_SECRET,MEDIASOUP_ANNOUNCED_IP
-          script: |
-            set -euo pipefail
-            cat > /opt/telecord-mediasoup-src/mediasoup/.env <<EOF2
-            MEDIASOUP_INTERNAL_SECRET=$MEDIASOUP_INTERNAL_SECRET
-            MEDIASOUP_ANNOUNCED_IP=$MEDIASOUP_ANNOUNCED_IP
-            EOF2
-        env:
-          MEDIASOUP_INTERNAL_SECRET: ${{ secrets.MEDIASOUP_INTERNAL_SECRET || vars.MEDIASOUP_INTERNAL_SECRET }}
-          MEDIASOUP_ANNOUNCED_IP: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-
-      - name: Builda a imagem e sobe o serviço na VM
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
-          username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
-          key: ${{ env.LIVEKIT_VM_SSH_KEY }}
-          # command_timeout padrão do appleboy/ssh-action é 10m — o build
-          # (pnpm install + tsc + download do worker nativo do mediasoup)
-          # nesta VM de ~500MB de RAM já levou passou disso (10m32s
-          # observado), batendo em "Run Command Timeout" a um passo do fim
-          # (EXPOSE, penúltimo do Dockerfile). Não é o build travando, é só
-          # o limite do próprio ssh-action sendo curto demais para esta VM.
-          command_timeout: 20m
-          script: |
-            set -euo pipefail
-            cd /opt/telecord-mediasoup-src/mediasoup
-            docker compose -f docker-compose.prod.yml --env-file .env build
-            docker compose -f docker-compose.prod.yml --env-file .env up -d --remove-orphans
-
-      - name: Verifica o deploy
-        env:
-          HOST: ${{ secrets.MEDIASOUP_PUBLIC_HOST || vars.MEDIASOUP_PUBLIC_HOST }}
-        run: |
-          set -euo pipefail
-          # Retry pelo mesmo motivo do healthcheck do LiveKit acima: `up -d`
-          # retorna assim que o container sobe, não quando o processo Node já
-          # está escutando em 3100.
-          ok=0
-          for i in $(seq 1 10); do
-            code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 10 "https://$HOST/healthz" || echo 000)
-            if [ "$code" = "200" ]; then
-              ok=1
-              break
-            fi
-            echo "tentativa $i: $code — aguardando o mediasoup-sfu subir…"
-            sleep 3
-          done
-          if [ "$ok" = "1" ]; then
-            echo "ok ($code)"
-          else
-            echo "::error::https://$HOST/healthz respondeu $code"
-            cat /tmp/health.json || true
-            exit 1
-          fi
-          echo "### mediasoup-sfu verificado" >> "$GITHUB_STEP_SUMMARY"
-          echo "https://$HOST" >> "$GITHUB_STEP_SUMMARY"
+  # deploy-mediasoup:
+  #   name: Publica o mediasoup-sfu (VM)
+  #   needs: [verify, deploy-proxy, deploy-livekit]
+  #   if: github.event_name != 'pull_request'
+  #   runs-on: ubuntu-latest
+  #   environment:
+  #     name: Production
+  #   env:
+  #     LIVEKIT_VM_SSH_KEY: ${{ secrets.LIVEKIT_VM_SSH_KEY || vars.LIVEKIT_VM_SSH_KEY }}
+  #   steps:
+  #     - name: Mascara a chave, se veio de variable em texto plano
+  #       run: |
+  #         if [ -n "${LIVEKIT_VM_SSH_KEY:-}" ]; then
+  #           echo "::add-mask::$LIVEKIT_VM_SSH_KEY"
+  #         fi
+  #
+  #     - uses: actions/checkout@v5
+  #
+  #     - name: Garante a pasta de deploy na VM, com o dono certo
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         script: |
+  #           set -euo pipefail
+  #           sudo mkdir -p /opt/telecord-mediasoup-src
+  #           sudo chown "$(whoami)":"$(whoami)" /opt/telecord-mediasoup-src
+  #
+  #     - name: Copia o repositório para a VM
+  #       uses: appleboy/scp-action@v0.1.7
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         source: '.'
+  #         target: /opt/telecord-mediasoup-src
+  #
+  #     - name: Escreve o .env do mediasoup-sfu na VM
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         envs: MEDIASOUP_INTERNAL_SECRET,MEDIASOUP_ANNOUNCED_IP
+  #         script: |
+  #           set -euo pipefail
+  #           cat > /opt/telecord-mediasoup-src/mediasoup/.env <<EOF2
+  #           MEDIASOUP_INTERNAL_SECRET=$MEDIASOUP_INTERNAL_SECRET
+  #           MEDIASOUP_ANNOUNCED_IP=$MEDIASOUP_ANNOUNCED_IP
+  #           EOF2
+  #       env:
+  #         MEDIASOUP_INTERNAL_SECRET: ${{ secrets.MEDIASOUP_INTERNAL_SECRET || vars.MEDIASOUP_INTERNAL_SECRET }}
+  #         MEDIASOUP_ANNOUNCED_IP: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #
+  #     - name: Builda a imagem e sobe o serviço na VM
+  #       uses: appleboy/ssh-action@v1.2.0
+  #       with:
+  #         host: ${{ secrets.LIVEKIT_VM_HOST || vars.LIVEKIT_VM_HOST }}
+  #         username: ${{ secrets.LIVEKIT_VM_USER || vars.LIVEKIT_VM_USER }}
+  #         key: ${{ env.LIVEKIT_VM_SSH_KEY }}
+  #         command_timeout: 20m
+  #         script: |
+  #           set -euo pipefail
+  #           cd /opt/telecord-mediasoup-src/mediasoup
+  #           docker compose -f docker-compose.prod.yml --env-file .env build
+  #           docker compose -f docker-compose.prod.yml --env-file .env up -d --remove-orphans
+  #
+  #     - name: Verifica o deploy
+  #       env:
+  #         HOST: ${{ secrets.MEDIASOUP_PUBLIC_HOST || vars.MEDIASOUP_PUBLIC_HOST }}
+  #       run: |
+  #         set -euo pipefail
+  #         ok=0
+  #         for i in $(seq 1 10); do
+  #           code=$(curl -sS -o /tmp/health.json -w '%{http_code}' --max-time 10 "https://$HOST/healthz" || echo 000)
+  #           if [ "$code" = "200" ]; then
+  #             ok=1
+  #             break
+  #           fi
+  #           echo "tentativa $i: $code — aguardando o mediasoup-sfu subir…"
+  #           sleep 3
+  #         done
+  #         if [ "$ok" = "1" ]; then
+  #           echo "ok ($code)"
+  #         else
+  #           echo "::error::https://$HOST/healthz respondeu $code"
+  #           cat /tmp/health.json || true
+  #           exit 1
+  #         fi
+  #         echo "### mediasoup-sfu verificado" >> "$GITHUB_STEP_SUMMARY"
+  #         echo "https://$HOST" >> "$GITHUB_STEP_SUMMARY"
+  #
+  # Comentado: deploy do mediasoup-sfu em VM (não usado no Telecord simples).
+  # Reative removendo os '#' no início destas linhas.
